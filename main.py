@@ -1,142 +1,81 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
-from typing import Optional
 import os
-import uuid
-import shutil
-import mimetypes
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-app = FastAPI(title="MP3 Player API", version="1.0.0")
+app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# In-memory track store (replace with a DB in production)
-tracks_db: dict[str, dict] = {}
-
-# Seed with some demo tracks
-for i, demo in enumerate([
-    {"title": "Midnight Drive", "artist": "The Neon Collective", "duration": 222},
-    {"title": "Golden Hour",    "artist": "Solstice Radio",      "duration": 255},
-    {"title": "Slow Burn",      "artist": "Luna Park",           "duration": 238},
-    {"title": "Coastline",      "artist": "The Neon Collective", "duration": 302},
-    {"title": "City Lights",    "artist": "Solstice Radio",      "duration": 208},
-], 1):
-    tid = str(uuid.uuid4())
-    tracks_db[tid] = {
-        "id": tid,
-        "title": demo["title"],
-        "artist": demo["artist"],
-        "duration": demo["duration"],
-        "file_path": None,
-        "order": i,
-    }
+def get_spotify_client() -> spotipy.Spotify:
+    return spotipy.Spotify(auth_manager=SpotifyOAuth(
+        client_id=os.environ.get("SPOTIPY_CLIENT_ID"),
+        client_secret=os.environ.get("SPOTIPY_CLIENT_SECRET"),
+        redirect_uri=os.environ.get("SPOTIPY_REDIRECT_URI", "http://localhost:5000/callback"),
+        scope="playlist-read-private playlist-read-collaborative",
+        cache_path=".spotify_token_cache"
+    ))
 
 
-class TrackUpdate(BaseModel):
-    title: Optional[str] = None
-    artist: Optional[str] = None
+def parse_playlist_tracks(playlist_id: str, sp: spotipy.Spotify):
+    tracks = []
+    offset = 0
+
+    while True:
+        response = sp.playlist_items(
+            playlist_id,
+            limit=100,
+            offset=offset,
+            fields="items(track(name,album(release_date))),next",
+            additional_types=["track"]
+        )
+
+        for item in response.get("items", []):
+            track = item.get("track")
+            if track and track.get("name") and track.get("album", {}).get("release_date"):
+                tracks.append({
+                    "name": track["name"],
+                    "year": int(track["album"]["release_date"][:4])
+                })
+
+        if response.get("next") is None:
+            break
+
+        offset += 100
+
+    return tracks
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+class Track(BaseModel):
+    name: str
+    year: int
 
-@app.get("/")
-def root():
-    return 'mp3_player.html'
-
-
-@app.get("/tracks")
-def list_tracks():
-    """Return all tracks sorted by insertion order."""
-    sorted_tracks = sorted(tracks_db.values(), key=lambda t: t["order"])
-    return [_public(t) for t in sorted_tracks]
+class PlaylistResponse(BaseModel):
+    playlist_id: str
+    total: int
+    tracks: list[Track]
 
 
-@app.get("/tracks/{track_id}")
-def get_track(track_id: str):
-    """Return metadata for a single track."""
-    track = _get_or_404(track_id)
-    return _public(track)
+@app.get("/playlist/{playlist_id}/tracks", response_model=PlaylistResponse)
+def get_playlist_tracks(playlist_id: str):
+    """
+    Returns all tracks from a Spotify playlist in {name, year} format.
 
+    - **playlist_id**: Spotify playlist ID (e.g. 6kXjeKURGZ0Dug50hUsiDf)
+    """
+    try:
+        sp = get_spotify_client()
+        tracks = parse_playlist_tracks(playlist_id, sp)
+        return PlaylistResponse(
+            playlist_id=playlist_id,
+            total=len(tracks),
+            tracks=tracks
+        )
+    except spotipy.exceptions.SpotifyException as e:
+        if e.http_status == 401:
+            raise HTTPException(status_code=401, detail="Spotify authentication failed. Delete .spotify_token_cache and retry.")
+        elif e.http_status == 403:
+            raise HTTPException(status_code=403, detail="Access denied. Make sure the playlist is public or you have the right scopes.")
+        elif e.http_status == 404:
+            raise HTTPException(status_code=404, detail=f"Playlist '{playlist_id}' not found.")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/tracks/upload", status_code=201)
-async def upload_track(
-    file: UploadFile = File(...),
-    title: Optional[str] = None,
-    artist: Optional[str] = None,
-):
-    """Upload an MP3 file and register it as a track."""
-    if not file.filename.lower().endswith(".mp3"):
-        raise HTTPException(status_code=400, detail="Only .mp3 files are accepted")
-
-    track_id = str(uuid.uuid4())
-    dest = os.path.join(UPLOAD_DIR, f"{track_id}.mp3")
-
-    with open(dest, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    track = {
-        "id": track_id,
-        "title": title or os.path.splitext(file.filename)[0],
-        "artist": artist or "Unknown Artist",
-        "duration": None,   # could parse with mutagen in a real app
-        "file_path": dest,
-        "order": len(tracks_db) + 1,
-    }
-    tracks_db[track_id] = track
-    return _public(track)
-
-
-@app.patch("/tracks/{track_id}")
-def update_track(track_id: str, body: TrackUpdate):
-    """Update title and/or artist of a track."""
-    track = _get_or_404(track_id)
-    if body.title is not None:
-        track["title"] = body.title
-    if body.artist is not None:
-        track["artist"] = body.artist
-    return _public(track)
-
-
-@app.delete("/tracks/{track_id}", status_code=204)
-def delete_track(track_id: str):
-    """Delete a track and its uploaded file (if any)."""
-    track = _get_or_404(track_id)
-    if track["file_path"] and os.path.exists(track["file_path"]):
-        os.remove(track["file_path"])
-    del tracks_db[track_id]
-
-
-@app.get("/tracks/{track_id}/stream")
-def stream_track(track_id: str):
-    """Stream the MP3 audio file for a track."""
-    track = _get_or_404(track_id)
-    if not track["file_path"] or not os.path.exists(track["file_path"]):
-        raise HTTPException(status_code=404, detail="Audio file not found for this track")
-    return FileResponse(
-        track["file_path"],
-        media_type="audio/mpeg",
-        headers={"Accept-Ranges": "bytes"},
-    )
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _get_or_404(track_id: str) -> dict:
-    if track_id not in tracks_db:
-        raise HTTPException(status_code=404, detail="Track not found")
-    return tracks_db[track_id]
-
-
-def _public(track: dict) -> dict:
-    """Strip internal fields before returning to the client."""
-    return {k: v for k, v in track.items() if k != "file_path"}
